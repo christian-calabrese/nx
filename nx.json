@@ -109,10 +109,6 @@
   },
   "targetDefaults": [
     {
-      "target": "mvn:*",
-      "cache": false
-    },
-    {
       "target": "cleanup-tsconfig",
       "executor": "nx:run-commands",
       "options": {
