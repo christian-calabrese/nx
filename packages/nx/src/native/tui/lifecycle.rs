@@ -724,6 +724,10 @@ pub fn restore_terminal() -> napi::Result<()> {
     // Clear terminal progress indicator
     App::clear_terminal_progress();
 
+    // Disable mouse capture (safe even if it was never enabled) so the terminal
+    // stops emitting mouse escape sequences once the TUI tears down.
+    let _ = super::tui::disable_mouse_capture();
+
     // Drain pending terminal responses (e.g., OSC color query responses)
     // to prevent escape sequences from leaking to the terminal on exit
     super::tui::drain_stdin();

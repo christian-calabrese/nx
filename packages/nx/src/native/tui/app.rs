@@ -1,5 +1,7 @@
 use color_eyre::eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+use super::scroll_momentum::ScrollDirection;
 #[cfg(not(test))]
 use napi::threadsafe_function::ThreadsafeFunction;
 #[cfg(not(test))]
@@ -651,6 +653,9 @@ impl App {
             }
             tui::Event::Render => action_tx.send(Action::Render)?,
             tui::Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
+            tui::Event::Mouse(mouse) => {
+                self.handle_mouse_event(mouse, action_tx);
+            }
             tui::Event::Key(key) => {
                 trace!("Handling Key Event: {:?}", key);
 
@@ -1832,6 +1837,41 @@ impl App {
             Ok(())
         } else {
             Ok(())
+        }
+    }
+
+    /// Handle a mouse event from the terminal.
+    ///
+    /// The mouse is only captured in fullscreen mode (see `Tui::enter` and
+    /// `Tui::switch_mode`), so this is only reached there. In Tier 1 we handle
+    /// wheel scrolling; clicks and drags are added in later tiers.
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, action_tx: &mpsc::UnboundedSender<Action>) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_focused(ScrollDirection::Up, action_tx),
+            MouseEventKind::ScrollDown => self.scroll_focused(ScrollDirection::Down, action_tx),
+            // Other mouse kinds (clicks, drags, moves) are handled in later tiers.
+            _ => {}
+        }
+    }
+
+    /// Scroll the currently focused element in `direction`.
+    ///
+    /// A focused output pane scrolls its terminal buffer using the same momentum
+    /// model as keyboard scrolling; otherwise the wheel moves the task-list
+    /// selection. (Tier 2 upgrades this to scroll whatever is under the cursor.)
+    fn scroll_focused(
+        &mut self,
+        direction: ScrollDirection,
+        action_tx: &mpsc::UnboundedSender<Action>,
+    ) {
+        if let Focus::MultipleOutput(pane_idx) = self.focus {
+            self.terminal_pane_data[pane_idx].handle_mouse_scroll(direction);
+        } else {
+            let action = match direction {
+                ScrollDirection::Up => Action::PreviousTask,
+                ScrollDirection::Down => Action::NextTask,
+            };
+            let _ = action_tx.send(action);
         }
     }
 

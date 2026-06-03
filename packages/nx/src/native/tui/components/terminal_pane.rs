@@ -225,6 +225,13 @@ impl TerminalPaneData {
             }
         }
     }
+
+    /// Public entry point for mouse-wheel scrolling of the terminal output.
+    /// Reuses the same momentum model as keyboard scrolling so the wheel and
+    /// arrow keys feel consistent.
+    pub fn handle_mouse_scroll(&mut self, direction: ScrollDirection) {
+        self.scroll(direction);
+    }
 }
 
 impl Default for TerminalPaneData {
