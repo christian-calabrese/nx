@@ -1867,7 +1867,11 @@ impl TasksList {
         // rows are `None` and are not selectable.
         let entry = {
             let manager = self.selection_manager.lock();
-            manager.get_viewport_entries().into_iter().nth(index).flatten()
+            manager
+                .get_viewport_entries()
+                .into_iter()
+                .nth(index)
+                .flatten()
         }?;
 
         match &entry {
@@ -2508,7 +2512,12 @@ impl TasksList {
     }
 
     /// Renders messages received from Nx Cloud
-    fn render_cloud_message(&mut self, f: &mut Frame<'_>, cloud_message_area: Rect, is_dimmed: bool) {
+    fn render_cloud_message(
+        &mut self,
+        f: &mut Frame<'_>,
+        cloud_message_area: Rect,
+        is_dimmed: bool,
+    ) {
         // Region of the rendered cloud link, captured for mouse hit-testing.
         // Computed into a local while `self.cloud_message` is borrowed, then
         // assigned to the field after that borrow ends.

@@ -126,6 +126,8 @@ pub struct App {
     mouse_regions: Vec<MouseRegion>,
     /// Timestamp + cell of the last left-button press, for double-click detection.
     last_click: Option<(std::time::Instant, u16, u16)>,
+    /// Index of the pane an in-progress text-selection drag belongs to.
+    selecting_pane: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +375,7 @@ impl App {
             restored_from_mode_switch: has_restored_state,
             mouse_regions: Vec::new(),
             last_click: None,
+            selecting_pane: None,
             // Restore batch states from TuiState (mode switching persistence)
             batch_states: batch_metadata
                 .iter()
@@ -1924,11 +1927,12 @@ impl App {
         let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_at(col, row, ScrollDirection::Up, action_tx),
-            MouseEventKind::ScrollDown => self.scroll_at(col, row, ScrollDirection::Down, action_tx),
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.handle_left_click(col, row, action_tx)
+            MouseEventKind::ScrollDown => {
+                self.scroll_at(col, row, ScrollDirection::Down, action_tx)
             }
-            // Drag/move/up and other buttons are handled in the selection tier.
+            MouseEventKind::Down(MouseButton::Left) => self.handle_left_press(col, row),
+            MouseEventKind::Drag(MouseButton::Left) => self.handle_left_drag(col, row),
+            MouseEventKind::Up(MouseButton::Left) => self.handle_left_release(),
             _ => {}
         }
     }
@@ -1994,14 +1998,9 @@ impl App {
         }
     }
 
-    /// Handle a left mouse button press: focus/select what was clicked and, on a
-    /// double-click, drop into the inline view.
-    fn handle_left_click(
-        &mut self,
-        col: u16,
-        row: u16,
-        _action_tx: &mpsc::UnboundedSender<Action>,
-    ) {
+    /// Handle a left mouse button press: focus/select what was clicked, begin a
+    /// text selection in a pane, and on a double-click drop into the inline view.
+    fn handle_left_press(&mut self, col: u16, row: u16) {
         // Detect a double-click: a second press on the same row within the window.
         let now = std::time::Instant::now();
         let is_double = self
@@ -2014,11 +2013,21 @@ impl App {
             Some(MouseRegionKind::Pane(pane_idx)) => {
                 // Focus the clicked pane; double-click drops to inline (NXC-3942).
                 self.update_focus(Focus::MultipleOutput(pane_idx));
+                self.terminal_pane_data[pane_idx].clear_selection();
                 if is_double {
                     self.dispatch_action(Action::SwitchMode(TuiMode::Inline));
+                    return;
+                }
+                // Begin a text selection drag at the clicked cell (NXC-3946).
+                if let Some((r, c)) = self.terminal_pane_data[pane_idx].content_coords_at(col, row)
+                {
+                    self.terminal_pane_data[pane_idx].begin_selection(r, c);
+                    self.selecting_pane = Some(pane_idx);
                 }
             }
             Some(MouseRegionKind::TaskList) => {
+                // Interacting with the list clears any pending pane selection.
+                self.clear_all_pane_selections();
                 // Resolve the click within the task list (row vs. cloud link).
                 let result = self
                     .components
@@ -2037,6 +2046,38 @@ impl App {
                 }
             }
             None => {}
+        }
+    }
+
+    /// Extend the in-progress text selection as the mouse drags, auto-scrolling
+    /// the pane when the cursor reaches its top or bottom edge (NXC-3946).
+    fn handle_left_drag(&mut self, col: u16, row: u16) {
+        let Some(pane_idx) = self.selecting_pane else {
+            return;
+        };
+        match self.terminal_pane_data[pane_idx].content_edge(row) {
+            -1 => self.terminal_pane_data[pane_idx].handle_mouse_scroll(ScrollDirection::Up),
+            1 => self.terminal_pane_data[pane_idx].handle_mouse_scroll(ScrollDirection::Down),
+            _ => {}
+        }
+        if let Some((r, c)) = self.terminal_pane_data[pane_idx].content_coords_clamped(col, row) {
+            self.terminal_pane_data[pane_idx].update_selection(r, c);
+        }
+    }
+
+    /// Finish a text selection drag and copy the result to the clipboard.
+    fn handle_left_release(&mut self) {
+        if let Some(pane_idx) = self.selecting_pane.take()
+            && self.terminal_pane_data[pane_idx].finish_selection()
+        {
+            self.terminal_pane_data[pane_idx].copy_selection();
+        }
+    }
+
+    /// Clear text selections in every pane.
+    fn clear_all_pane_selections(&mut self) {
+        for pane in &mut self.terminal_pane_data {
+            pane.clear_selection();
         }
     }
 
