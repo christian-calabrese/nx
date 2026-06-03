@@ -259,6 +259,9 @@ pub struct TasksList {
     /// Screen rect + URL of the rendered cloud-message link, captured during
     /// render so a click on it can open the link.
     cloud_link_hit: Option<(Rect, String)>,
+    /// Screen rect of the table's text region (excluding the scrollbar column),
+    /// captured during render so a drag can select task ids/statuses/durations.
+    text_selection_area: Option<Rect>,
 }
 
 /// Outcome of a mouse click landing inside the task list, returned to the App so
@@ -329,6 +332,7 @@ impl TasksList {
             needs_sort: false,
             rows_hit_area: None,
             cloud_link_hit: None,
+            text_selection_area: None,
         };
 
         // Sort tasks to populate task selection list
@@ -1836,6 +1840,12 @@ impl TasksList {
         total_entries > dynamic_viewport_height
     }
 
+    /// The table's text region from the last render, used to bound a drag-based
+    /// text selection (and exclude the scrollbar).
+    pub fn selection_area(&self) -> Option<Rect> {
+        self.text_selection_area
+    }
+
     /// Resolve a left-click at terminal cell `(col, row)` within the task list.
     ///
     /// The cloud link is checked first; otherwise the row is mapped to a viewport
@@ -2231,6 +2241,11 @@ impl TasksList {
             .style(self.get_table_style());
 
         f.render_widget(t, table_render_area);
+
+        // The text region is the table minus the scrollbar/padding, so a drag
+        // selection never grabs the scrollbar glyph. (Set after rendering to
+        // avoid overlapping the immutable `header` borrow above.)
+        self.text_selection_area = Some(table_render_area);
 
         // Render scrollbar if needed
         if let Some(scrollbar_area) = scrollbar_area {

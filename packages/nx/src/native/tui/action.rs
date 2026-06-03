@@ -38,6 +38,7 @@ pub enum Action {
     StartTasks(Vec<Task>),
     EndTasks(Vec<TaskResult>),
     ToggleDebugMode,
+    ToggleMouseCapture,
     SendConsoleMessage(String),
     ConsoleMessengerAvailable(bool),
     EndCommand,
