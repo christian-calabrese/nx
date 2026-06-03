@@ -1,5 +1,5 @@
 use color_eyre::eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::scroll_momentum::ScrollDirection;
 #[cfg(not(test))]
@@ -39,7 +39,7 @@ use super::components::layout_manager::{
 use super::components::task_selection_manager::{
     SelectionEntry, SelectionMode, TaskSelectionManager,
 };
-use super::components::tasks_list::{TaskStatus, TasksList};
+use super::components::tasks_list::{TaskListClick, TaskStatus, TasksList};
 use super::components::terminal_pane::{TerminalPane, TerminalPaneData, TerminalPaneState};
 use super::graph_utils::{get_task_count, is_task_continuous};
 use super::lifecycle::{BatchStatus, RunMode, TuiMode};
@@ -121,6 +121,11 @@ pub struct App {
     // Batch tracking
     batch_states: HashMap<String, BatchState>, // batch_id → BatchState
     completed_pinned_batches: HashMap<String, CompletedBatchInfo>, // Completed batches still pinned to panes
+    /// Hit-test regions captured during the last render, used to route mouse
+    /// clicks/scrolls to whatever is under the cursor. Rebuilt every frame.
+    mouse_regions: Vec<MouseRegion>,
+    /// Timestamp + cell of the last left-button press, for double-click detection.
+    last_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +135,61 @@ pub enum Focus {
     HelpPopup,
     CountdownPopup,
     HintPopup,
+}
+
+/// A rectangular region captured during the last render that mouse events can
+/// target. Rebuilt every frame so hit-testing always reflects what's on screen.
+#[derive(Debug, Clone, Copy)]
+struct MouseRegion {
+    rect: Rect,
+    kind: MouseRegionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseRegionKind {
+    /// The task list panel. Row vs. cloud-link resolution is delegated to the
+    /// `TasksList` component, which knows its own internal geometry.
+    TaskList,
+    /// An output pane, identified by its index into `terminal_pane_data`.
+    Pane(usize),
+}
+
+/// Maximum delay between two left-clicks (on the same row) to count as a
+/// double-click. crossterm reports individual button presses, so we detect
+/// double-clicks ourselves.
+const DOUBLE_CLICK_MS: u128 = 400;
+
+/// Open a URL in the user's default browser (NXC-3940). Best-effort: any
+/// failure is ignored so a missing opener can never crash the TUI. The child's
+/// stdio is detached to null so it can't corrupt the terminal we're drawing to.
+fn open_url(url: &str) {
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        // The empty "" is the window title argument that `start` expects first.
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+
+    let _ = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 impl App {
@@ -311,6 +371,8 @@ impl App {
             debug_mode: false,
             debug_state: TuiWidgetState::default().set_default_display_level(LevelFilter::Debug),
             restored_from_mode_switch: has_restored_state,
+            mouse_regions: Vec::new(),
+            last_click: None,
             // Restore batch states from TuiState (mode switching persistence)
             batch_states: batch_metadata
                 .iter()
@@ -1158,6 +1220,9 @@ impl App {
                 debug!("Debug mode: {}", self.debug_mode);
             }
             Action::Render => {
+                // Hit-test regions are rebuilt every frame inside the draw closure,
+                // then stored on self so mouse events can resolve what's under the cursor.
+                let mut captured_regions: Vec<MouseRegion> = Vec::new();
                 tui.draw(|f| {
                     let area = f.area();
 
@@ -1263,6 +1328,10 @@ impl App {
                             .find_map(|c| c.as_any_mut().downcast_mut::<TasksList>())
                     {
                         let _ = tasks_list.draw(f, task_list_area);
+                        captured_regions.push(MouseRegion {
+                            rect: task_list_area,
+                            kind: MouseRegionKind::TaskList,
+                        });
                     }
 
                     // Clone terminal pane areas upfront to avoid borrow conflicts with self
@@ -1347,6 +1416,10 @@ impl App {
                             }
                         }
 
+                        captured_regions.push(MouseRegion {
+                            rect: pane_area,
+                            kind: MouseRegionKind::Pane(pane_idx),
+                        });
                         physical_idx += 1;
                     }
 
@@ -1375,6 +1448,7 @@ impl App {
                     }
                 })
                 .ok();
+                self.mouse_regions = captured_regions;
             }
             Action::SendConsoleMessage(msg) => {
                 let state = self.core.state().lock();
@@ -1843,22 +1917,71 @@ impl App {
     /// Handle a mouse event from the terminal.
     ///
     /// The mouse is only captured in fullscreen mode (see `Tui::enter` and
-    /// `Tui::switch_mode`), so this is only reached there. In Tier 1 we handle
-    /// wheel scrolling; clicks and drags are added in later tiers.
+    /// `Tui::switch_mode`), so this is only reached there. Wheel events scroll
+    /// whatever is under the cursor; left-clicks select/focus and double-clicks
+    /// drop into the inline view.
     fn handle_mouse_event(&mut self, mouse: MouseEvent, action_tx: &mpsc::UnboundedSender<Action>) {
+        let (col, row) = (mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_focused(ScrollDirection::Up, action_tx),
-            MouseEventKind::ScrollDown => self.scroll_focused(ScrollDirection::Down, action_tx),
-            // Other mouse kinds (clicks, drags, moves) are handled in later tiers.
+            MouseEventKind::ScrollUp => self.scroll_at(col, row, ScrollDirection::Up, action_tx),
+            MouseEventKind::ScrollDown => self.scroll_at(col, row, ScrollDirection::Down, action_tx),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_left_click(col, row, action_tx)
+            }
+            // Drag/move/up and other buttons are handled in the selection tier.
             _ => {}
         }
     }
 
-    /// Scroll the currently focused element in `direction`.
-    ///
-    /// A focused output pane scrolls its terminal buffer using the same momentum
-    /// model as keyboard scrolling; otherwise the wheel moves the task-list
-    /// selection. (Tier 2 upgrades this to scroll whatever is under the cursor.)
+    /// Find the topmost hit-test region under a cell, if any. Iterates in
+    /// reverse so regions drawn later (on top) win ties.
+    fn region_at(&self, col: u16, row: u16) -> Option<MouseRegionKind> {
+        self.mouse_regions
+            .iter()
+            .rev()
+            .find(|r| {
+                col >= r.rect.x
+                    && col < r.rect.x.saturating_add(r.rect.width)
+                    && row >= r.rect.y
+                    && row < r.rect.y.saturating_add(r.rect.height)
+            })
+            .map(|r| r.kind)
+    }
+
+    /// Scroll whatever is under the cursor: an output pane scrolls its buffer,
+    /// the task list moves its selection, and empty space falls back to the
+    /// focused element.
+    fn scroll_at(
+        &mut self,
+        col: u16,
+        row: u16,
+        direction: ScrollDirection,
+        action_tx: &mpsc::UnboundedSender<Action>,
+    ) {
+        match self.region_at(col, row) {
+            Some(MouseRegionKind::Pane(pane_idx)) => {
+                self.terminal_pane_data[pane_idx].handle_mouse_scroll(direction);
+            }
+            Some(MouseRegionKind::TaskList) => self.send_list_scroll(direction, action_tx),
+            None => self.scroll_focused(direction, action_tx),
+        }
+    }
+
+    /// Move the task-list selection in `direction` (wheel over the list).
+    fn send_list_scroll(
+        &self,
+        direction: ScrollDirection,
+        action_tx: &mpsc::UnboundedSender<Action>,
+    ) {
+        let action = match direction {
+            ScrollDirection::Up => Action::PreviousTask,
+            ScrollDirection::Down => Action::NextTask,
+        };
+        let _ = action_tx.send(action);
+    }
+
+    /// Scroll the currently focused element when the cursor isn't over a known
+    /// region (e.g. the gap between panes).
     fn scroll_focused(
         &mut self,
         direction: ScrollDirection,
@@ -1867,11 +1990,53 @@ impl App {
         if let Focus::MultipleOutput(pane_idx) = self.focus {
             self.terminal_pane_data[pane_idx].handle_mouse_scroll(direction);
         } else {
-            let action = match direction {
-                ScrollDirection::Up => Action::PreviousTask,
-                ScrollDirection::Down => Action::NextTask,
-            };
-            let _ = action_tx.send(action);
+            self.send_list_scroll(direction, action_tx);
+        }
+    }
+
+    /// Handle a left mouse button press: focus/select what was clicked and, on a
+    /// double-click, drop into the inline view.
+    fn handle_left_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        _action_tx: &mpsc::UnboundedSender<Action>,
+    ) {
+        // Detect a double-click: a second press on the same row within the window.
+        let now = std::time::Instant::now();
+        let is_double = self
+            .last_click
+            .map(|(t, _c, r)| r == row && now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS)
+            .unwrap_or(false);
+        self.last_click = Some((now, col, row));
+
+        match self.region_at(col, row) {
+            Some(MouseRegionKind::Pane(pane_idx)) => {
+                // Focus the clicked pane; double-click drops to inline (NXC-3942).
+                self.update_focus(Focus::MultipleOutput(pane_idx));
+                if is_double {
+                    self.dispatch_action(Action::SwitchMode(TuiMode::Inline));
+                }
+            }
+            Some(MouseRegionKind::TaskList) => {
+                // Resolve the click within the task list (row vs. cloud link).
+                let result = self
+                    .components
+                    .iter_mut()
+                    .find_map(|c| c.as_any_mut().downcast_mut::<TasksList>())
+                    .map(|tl| tl.handle_click(col, row, is_double));
+                match result.flatten() {
+                    // Selecting a task focuses the list (NXC-3941); double-click a
+                    // selected task drops to inline (NXC-3943).
+                    Some(TaskListClick::Select) => self.update_focus(Focus::TaskList),
+                    Some(TaskListClick::EnterInline) => {
+                        self.dispatch_action(Action::SwitchMode(TuiMode::Inline))
+                    }
+                    Some(TaskListClick::OpenLink(url)) => open_url(&url),
+                    None => {}
+                }
+            }
+            None => {}
         }
     }
 

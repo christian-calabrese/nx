@@ -252,6 +252,34 @@ pub struct TasksList {
     terminal_width: Option<u16>, // Cached terminal width for column visibility calculation
     in_progress_tasks: Vec<String>, // Standalone in-progress tasks for selection (excludes batched)
     needs_sort: bool,            // Deferred sort flag - sort once per render frame
+    /// Screen rect of the scrollable rows area (the table minus its header
+    /// overhead), captured during render so mouse clicks can map a row to an
+    /// entry. Each visible viewport entry occupies one row.
+    rows_hit_area: Option<Rect>,
+    /// Screen rect + URL of the rendered cloud-message link, captured during
+    /// render so a click on it can open the link.
+    cloud_link_hit: Option<(Rect, String)>,
+}
+
+/// Outcome of a mouse click landing inside the task list, returned to the App so
+/// it can react (focus, mode switch, or open a link) outside the component's
+/// borrow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskListClick {
+    /// A task/batch row was selected.
+    Select,
+    /// A task row was double-clicked — enter the inline view for it.
+    EnterInline,
+    /// The cloud link was clicked — open this URL.
+    OpenLink(String),
+}
+
+/// Returns true if the terminal cell `(col, row)` falls within `rect`.
+fn point_in_rect(col: u16, row: u16, rect: Rect) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 impl TasksList {
@@ -299,6 +327,8 @@ impl TasksList {
             terminal_width: None,
             in_progress_tasks: Vec::new(),
             needs_sort: false,
+            rows_hit_area: None,
+            cloud_link_hit: None,
         };
 
         // Sort tasks to populate task selection list
@@ -1806,6 +1836,54 @@ impl TasksList {
         total_entries > dynamic_viewport_height
     }
 
+    /// Resolve a left-click at terminal cell `(col, row)` within the task list.
+    ///
+    /// The cloud link is checked first; otherwise the row is mapped to a viewport
+    /// entry (rows begin `TABLE_HEADER_OVERHEAD_ROWS` below the table top and are
+    /// one entry tall). A task/batch row updates the selection and returns
+    /// `Select`, or `EnterInline` on a double-click. Returns `None` when the
+    /// click doesn't land on anything actionable (header, blank row, gap).
+    pub fn handle_click(&mut self, col: u16, row: u16, is_double: bool) -> Option<TaskListClick> {
+        // Cloud link takes priority over the rows around it.
+        if let Some((rect, url)) = &self.cloud_link_hit
+            && point_in_rect(col, row, *rect)
+        {
+            return Some(TaskListClick::OpenLink(url.clone()));
+        }
+
+        let area = self.rows_hit_area?;
+        if !point_in_rect(col, row, area) {
+            return None;
+        }
+
+        // Rows begin below the header overhead; clicks above that aren't rows.
+        let first_row_y = area.y.saturating_add(TABLE_HEADER_OVERHEAD_ROWS);
+        if row < first_row_y {
+            return None;
+        }
+        let index = (row - first_row_y) as usize;
+
+        // Map the row index to the visible viewport entry. Blank/placeholder
+        // rows are `None` and are not selectable.
+        let entry = {
+            let manager = self.selection_manager.lock();
+            manager.get_viewport_entries().into_iter().nth(index).flatten()
+        }?;
+
+        match &entry {
+            SelectionEntry::Task(task_id) => self.selection_manager.lock().select_task(task_id),
+            SelectionEntry::BatchGroup(batch_id) => {
+                self.selection_manager.lock().select_batch_group(batch_id)
+            }
+        }
+
+        if is_double {
+            Some(TaskListClick::EnterInline)
+        } else {
+            Some(TaskListClick::Select)
+        }
+    }
+
     /// Renders the main task table with scrollbar if needed.
     fn render_task_table(
         &mut self,
@@ -1815,6 +1893,9 @@ impl TasksList {
         needs_scrollbar: bool,
         scroll_metrics: &ScrollMetrics,
     ) {
+        // Record the table rect for mouse hit-testing. Rows start
+        // TABLE_HEADER_OVERHEAD_ROWS below the top and are one viewport entry tall.
+        self.rows_hit_area = Some(table_area);
         let visible_entries = self.selection_manager.lock().get_viewport_entries();
         let selected_style = Style::default()
             .fg(THEME.primary_fg)
@@ -2427,7 +2508,11 @@ impl TasksList {
     }
 
     /// Renders messages received from Nx Cloud
-    fn render_cloud_message(&self, f: &mut Frame<'_>, cloud_message_area: Rect, is_dimmed: bool) {
+    fn render_cloud_message(&mut self, f: &mut Frame<'_>, cloud_message_area: Rect, is_dimmed: bool) {
+        // Region of the rendered cloud link, captured for mouse hit-testing.
+        // Computed into a local while `self.cloud_message` is borrowed, then
+        // assigned to the field after that borrow ends.
+        let mut link_hit: Option<(Rect, String)> = None;
         if let Some(message) = &self.cloud_message {
             let available_width = cloud_message_area.width;
             // Ensure minimum width to render anything
@@ -2505,8 +2590,13 @@ impl TasksList {
                     Paragraph::new(message_line).alignment(Alignment::Left);
 
                 f.render_widget(cloud_message_paragraph, cloud_message_area);
+
+                // The whole rendered cloud row is the click target; opening uses
+                // the full (untruncated) URL even when the display was truncated.
+                link_hit = Some((cloud_message_area, url.to_string()));
             }
         }
+        self.cloud_link_hit = link_hit;
     }
 }
 
@@ -2517,6 +2607,9 @@ impl Component for TasksList {
     }
 
     fn draw(&mut self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
+        // Reset per-frame hit-test regions; they're repopulated as we render the
+        // rows and cloud message below.
+        self.cloud_link_hit = None;
         // Flush any pending sort before rendering
         self.prepare_for_render();
 
