@@ -4,7 +4,7 @@ import { type BuildStaticRemotesOptions } from './models';
 import { fork } from 'node:child_process';
 import { join } from 'path';
 import { workspaceDataDirectory } from 'nx/src/utils/cache-directory';
-import { createWriteStream } from 'fs';
+import { createWriteStream, readFileSync } from 'fs';
 import { childBuildEnv } from '../../utils/is-serve-mode';
 
 export async function buildStaticRemotes(
@@ -82,6 +82,13 @@ export async function buildStaticRemotes(
       staticProcess.stdout.removeAllListeners('data');
       staticProcess.stderr.removeAllListeners('data');
       if (code !== 0) {
+        try {
+          const logLines = readFileSync(remoteBuildLogFile, 'utf-8')
+            .split('\n')
+            .slice(-50)
+            .join('\n');
+          logger.error(logLines);
+        } catch {}
         rej(
           `Remote failed to start. A complete log can be found in: ${remoteBuildLogFile}`
         );
